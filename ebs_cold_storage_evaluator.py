@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-EBS Snapshot Tier Cost Evaluator v2
-Evaluates cold storage eligibility at the VOLUME level (not individual snapshots).
+EBS Snapshot Cold Storage Evaluator
+Evaluates cold storage eligibility at the VOLUME level using the EBS Direct API
+(ListChangedBlocks / ListSnapshotBlocks) to measure actual unique block ratios.
 
-Key insight: Archiving individual snapshots from a lineage does NOT save money because
-referenced blocks get re-attributed to remaining warm snapshots. Cold storage only
-makes sense when evaluated holistically per volume.
+Single threshold: 25% — archive saves money when unreferenced blocks >= 25% of full snapshot.
 
-Cold storage is viable when:
-1. Volume is decommissioned (no new snapshots, all can be archived together)
-2. Standalone/only snapshot (no lineage sharing)
-3. High-churn volume (>20% monthly change rate makes monthly snapshots cost-effective to archive)
-4. Compliance-only retention (snapshots kept for audit, rarely accessed)
+Math:
+  Standard tier:  $0.05/GB-month   (incremental only)
+  Archive tier:   $0.0125/GB-month (full snapshot)
+  Break-even:     unreferenced_size >= full_snapshot_size * (0.0125 / 0.05) = 25%
 """
 
 import boto3
@@ -22,27 +20,31 @@ from datetime import datetime, timedelta
 
 try:
     from openpyxl import Workbook
-    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.styles import PatternFill
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
 
 BLOCK_SIZE_BYTES = 524288  # 512 KiB
 ARCHIVE_MIN_DAYS = 90
+THRESHOLD_PCT = 25  # Single unambiguous threshold
 
 
 def get_ebs_pricing(session, region):
     """Get EBS snapshot pricing for Standard and Archive tiers."""
     ssm = session.client("ssm", region_name="us-east-1")
     try:
-        param = ssm.get_parameter(Name=f"/aws/service/global-infrastructure/regions/{region}/longName")
+        param = ssm.get_parameter(
+            Name=f"/aws/service/global-infrastructure/regions/{region}/longName"
+        )
         location = param["Parameter"]["Value"]
     except Exception:
         location = region
 
     pricing_client = session.client("pricing", region_name="us-east-1")
+    std_price = 0.05
     try:
-        std_response = pricing_client.get_products(
+        resp = pricing_client.get_products(
             ServiceCode="AmazonEC2",
             Filters=[
                 {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage Snapshot"},
@@ -51,29 +53,30 @@ def get_ebs_pricing(session, region):
             ],
             MaxResults=10,
         )
-        std_price = 0.05
-        for item in std_response["PriceList"]:
+        for item in resp["PriceList"]:
             product = json.loads(item)
-            terms = product.get("terms", {}).get("OnDemand", {})
-            for term in terms.values():
+            for term in product.get("terms", {}).get("OnDemand", {}).values():
                 for dim in term.get("priceDimensions", {}).values():
                     price = float(dim["pricePerUnit"]["USD"])
                     if price > 0:
                         std_price = price
                         break
     except Exception:
-        std_price = 0.05
-    return std_price, 0.0125
+        pass
+    return std_price, std_price * 0.25  # Archive is always 25% of standard
 
 
 def get_snapshots(ec2_client):
     """Get all completed standard-tier snapshots owned by this account."""
     snapshots = []
     paginator = ec2_client.get_paginator("describe_snapshots")
-    for page in paginator.paginate(Filters=[
-        {"Name": "status", "Values": ["completed"]},
-        {"Name": "storage-tier", "Values": ["standard"]},
-    ], OwnerIds=["self"]):
+    for page in paginator.paginate(
+        Filters=[
+            {"Name": "status", "Values": ["completed"]},
+            {"Name": "storage-tier", "Values": ["standard"]},
+        ],
+        OwnerIds=["self"],
+    ):
         snapshots.extend(page["Snapshots"])
     return snapshots
 
@@ -95,16 +98,14 @@ def get_backup_expiration(session):
                         continue
                     snap_id = rp_arn.split("/")[-1]
                     delete_at = rp.get("CalculatedLifecycle", {}).get("DeleteAt")
-                    lifecycle_days = rp.get("Lifecycle", {}).get("DeleteAfterDays")
                     if delete_at:
                         snap_expiration[snap_id] = {
                             "delete_at": delete_at,
                             "days_left": (delete_at - datetime.now(delete_at.tzinfo)).days,
-                            "retention_days": lifecycle_days,
-                            "source": f"AWS Backup ({vault['BackupVaultName']})",
+                            "retention_days": rp.get("Lifecycle", {}).get("DeleteAfterDays"),
                         }
     except Exception as e:
-        print(f"    Warning: Could not fully query AWS Backup: {e}")
+        print(f"  Warning: Could not fully query AWS Backup: {e}")
     return snap_expiration
 
 
@@ -119,45 +120,117 @@ def check_volume_exists(ec2_client, volume_id):
         return False
 
 
-def get_volume_write_activity(cw_client, volume_id, days=30):
-    """Get VolumeWriteBytes from CloudWatch to estimate change rate."""
-    try:
-        end = datetime.utcnow()
-        start = end - timedelta(days=days)
-        resp = cw_client.get_metric_statistics(
-            Namespace="AWS/EBS",
-            MetricName="VolumeWriteBytes",
-            Dimensions=[{"Name": "VolumeId", "Value": volume_id}],
-            StartTime=start, EndTime=end,
-            Period=86400 * days,  # single datapoint for entire period
-            Statistics=["Sum"],
-        )
-        datapoints = resp.get("Datapoints", [])
-        if datapoints:
-            return datapoints[0]["Sum"]
-    except Exception:
-        pass
-    return None
+def count_changed_blocks(ebs_client, first_snap_id, second_snap_id):
+    """Count changed blocks between two snapshots using ListChangedBlocks."""
+    count = 0
+    token = None
+    while True:
+        kwargs = {
+            "FirstSnapshotId": first_snap_id,
+            "SecondSnapshotId": second_snap_id,
+        }
+        if token:
+            kwargs["NextToken"] = token
+        resp = ebs_client.list_changed_blocks(**kwargs)
+        count += len(resp.get("ChangedBlocks", []))
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return count
+
+
+def count_snapshot_blocks(ebs_client, snapshot_id):
+    """Count total blocks in a snapshot using ListSnapshotBlocks."""
+    count = 0
+    token = None
+    while True:
+        kwargs = {"SnapshotId": snapshot_id}
+        if token:
+            kwargs["NextToken"] = token
+        resp = ebs_client.list_snapshot_blocks(**kwargs)
+        count += len(resp.get("Blocks", []))
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return count
+
+
+def get_unreferenced_blocks(ebs_client, snap_id, prev_snap_id, next_snap_id):
+    """
+    Find unreferenced blocks for a snapshot using ListChangedBlocks.
+    Unreferenced = blocks that changed from predecessor AND changed in successor.
+    These blocks are unique to this snapshot and won't be re-attributed.
+    """
+    # Blocks changed between predecessor and this snapshot
+    if prev_snap_id:
+        changed_from_prev = set()
+        token = None
+        while True:
+            kwargs = {"FirstSnapshotId": prev_snap_id, "SecondSnapshotId": snap_id}
+            if token:
+                kwargs["NextToken"] = token
+            resp = ebs_client.list_changed_blocks(**kwargs)
+            for block in resp.get("ChangedBlocks", []):
+                changed_from_prev.add(block["BlockIndex"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+    else:
+        # First snapshot in lineage — all its blocks are "changed from nothing"
+        changed_from_prev = None
+
+    # Blocks changed between this snapshot and successor
+    if next_snap_id:
+        changed_to_next = set()
+        token = None
+        while True:
+            kwargs = {"FirstSnapshotId": snap_id, "SecondSnapshotId": next_snap_id}
+            if token:
+                kwargs["NextToken"] = token
+            resp = ebs_client.list_changed_blocks(**kwargs)
+            for block in resp.get("ChangedBlocks", []):
+                changed_to_next.add(block["BlockIndex"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+    else:
+        # Last snapshot in lineage — none of its blocks are referenced by a successor
+        changed_to_next = None
+
+    # Unreferenced = in both sets (unique to this snapshot, not shared with neighbors)
+    if changed_from_prev is None and changed_to_next is None:
+        # Only snapshot — all blocks are unreferenced
+        return None  # Signal: use full snapshot size
+    elif changed_from_prev is None:
+        # First in lineage — unreferenced = blocks overwritten by successor
+        return len(changed_to_next)
+    elif changed_to_next is None:
+        # Last in lineage — unreferenced = blocks it changed from predecessor
+        return len(changed_from_prev)
+    else:
+        # Middle — unreferenced = blocks in BOTH sets
+        return len(changed_from_prev & changed_to_next)
 
 
 def evaluate_volumes(region, profile=None):
-    """Main evaluation - at VOLUME level."""
+    """Main evaluation at VOLUME level using EBS Direct API."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
-    cw = session.client("cloudwatch")
+    ebs = session.client("ebs")
 
     print(f"\n{'='*70}")
-    print(f"EBS Snapshot Cold Storage Evaluator v2 (Volume-Level Analysis)")
+    print(f"EBS Snapshot Cold Storage Evaluator (Volume-Level, 25% Threshold)")
     print(f"Region: {region} | Profile: {profile or 'default'}")
     print(f"{'='*70}")
 
     # Pricing
-    print("\n[1/5] Fetching EBS pricing...")
+    print("\n[1/4] Fetching EBS pricing...")
     std_price, archive_price = get_ebs_pricing(session, region)
     print(f"  Standard: ${std_price}/GB-month | Archive: ${archive_price}/GB-month")
+    print(f"  Break-even: unreferenced blocks >= 25% of full snapshot")
 
     # Snapshots
-    print("\n[2/5] Discovering snapshots...")
+    print("\n[2/4] Discovering snapshots...")
     snapshots = get_snapshots(ec2)
     print(f"  Found {len(snapshots)} completed standard-tier snapshots")
     if not snapshots:
@@ -165,12 +238,11 @@ def evaluate_volumes(region, profile=None):
         return
 
     # Expiration
-    print("\n[3/5] Checking expiration dates...")
+    print("\n[3/4] Checking expiration dates...")
     snap_expiration = get_backup_expiration(session)
     print(f"  Found expiration info for {len(snap_expiration)} snapshots")
 
     # Group by volume
-    print("\n[4/5] Grouping by volume...")
     vol_snaps = {}
     for snap in snapshots:
         vol_id = snap.get("VolumeId", "unknown")
@@ -179,35 +251,27 @@ def evaluate_volumes(region, profile=None):
         vol_snaps[vol_id].sort(key=lambda s: s["StartTime"])
     print(f"  {len(vol_snaps)} unique volumes")
 
-    # Evaluate each volume
-    print("\n[5/5] Evaluating volumes for cold storage eligibility...")
+    # Evaluate
+    print("\n[4/4] Evaluating volumes (EBS Direct API)...")
     volume_results = []
 
     for vol_id, snaps in vol_snaps.items():
         print(f"\n  Volume: {vol_id} ({len(snaps)} snapshots)")
-
         vol_size_gb = snaps[0]["VolumeSize"]
         oldest_snap = snaps[0]
         newest_snap = snaps[-1]
-        oldest_date = oldest_snap["StartTime"]
-        newest_date = newest_snap["StartTime"]
-        span_days = (newest_date - oldest_date).days
+        span_days = (newest_snap["StartTime"] - oldest_snap["StartTime"]).days
 
-        # Check if volume still exists (decommissioned = strong archive candidate)
         volume_exists = check_volume_exists(ec2, vol_id)
 
-        # Check expiration status for all snapshots
+        # Check expiration
         expired_count = 0
         active_expiry_count = 0
         min_expiry_days = None
-        max_retention = None
         for s in snaps:
             sid = s["SnapshotId"]
             if sid in snap_expiration:
                 days_left = snap_expiration[sid]["days_left"]
-                retention = snap_expiration[sid].get("retention_days")
-                if retention:
-                    max_retention = max(max_retention or 0, retention)
                 if days_left < 0:
                     expired_count += 1
                 else:
@@ -215,101 +279,88 @@ def evaluate_volumes(region, profile=None):
                     if min_expiry_days is None or days_left < min_expiry_days:
                         min_expiry_days = days_left
 
-        # Estimate total warm storage (sum of full snapshot sizes as proxy)
-        total_full_size_gb = sum(int(s.get("FullSnapshotSizeInBytes", 0)) for s in snaps) / (1024**3)
-        # For warm tier, actual billed = incremental (much less than sum of full sizes)
-        # Best proxy: newest snapshot's full size ≈ total unique data across lineage
-        newest_full_gb = int(newest_snap.get("FullSnapshotSizeInBytes", 0)) / (1024**3)
-        if newest_full_gb == 0:
-            newest_full_gb = vol_size_gb  # fallback
+        # Get full snapshot size (newest)
+        newest_full_bytes = int(newest_snap.get("FullSnapshotSizeInBytes", 0))
+        newest_full_gb = newest_full_bytes / (1024**3) if newest_full_bytes else vol_size_gb
 
-        # Estimate monthly change rate from CloudWatch (if volume exists)
-        monthly_change_rate = None
-        write_bytes_30d = None
-        if volume_exists:
-            write_bytes_30d = get_volume_write_activity(cw, vol_id, days=30)
-            if write_bytes_30d and vol_size_gb > 0:
-                write_gb = write_bytes_30d / (1024**3)
-                monthly_change_rate = (write_gb / vol_size_gb) * 100  # percentage
-
-        # === COLD STORAGE ELIGIBILITY DECISION ===
-        cold_eligible = False
+        # === DECISION LOGIC ===
         recommendation = ""
         reason = ""
+        unreferenced_pct = None
 
-        # Case 1: All snapshots expired - HOUSEKEEP first
+        # Case 1: All snapshots expired
         if expired_count == len(snaps):
             recommendation = "HOUSEKEEP - DELETE ALL"
             reason = (f"All {len(snaps)} snapshots have expired retention. "
-                      f"Delete to save ~${newest_full_gb * std_price * 3:.2f}/90d. "
-                      f"No cold storage needed - just delete.")
+                      f"Delete to save ~${newest_full_gb * std_price:.2f}/month.")
 
-        # Case 2: Volume decommissioned (doesn't exist) + no active expiry
-        elif not volume_exists and active_expiry_count == 0:
-            cold_eligible = True
-            recommendation = "COLD STORAGE CANDIDATE"
-            reason = (f"Volume decommissioned (no longer exists). No new snapshots being created. "
-                      f"All {len(snaps)} snapshots can be archived together as standalone full snapshots. "
-                      f"No block re-attribution issue since no warm snapshots will remain.")
-
-        # Case 3: Volume decommissioned but has active expiry < 90 days
-        elif not volume_exists and min_expiry_days is not None and min_expiry_days < ARCHIVE_MIN_DAYS:
+        # Case 2: Snapshots expire within 90 days
+        elif min_expiry_days is not None and min_expiry_days < ARCHIVE_MIN_DAYS:
             recommendation = "NOT ELIGIBLE"
-            reason = (f"Volume decommissioned but snapshots expire in {min_expiry_days} days "
-                      f"(< 90 day archive minimum). Let retention policy delete them naturally.")
+            reason = (f"Snapshots expire in {min_expiry_days} days "
+                      f"(< {ARCHIVE_MIN_DAYS}-day archive minimum).")
 
-        # Case 4: Single snapshot (no lineage)
-        elif len(snaps) == 1:
-            if newest_full_gb * archive_price < newest_full_gb * std_price:
-                cold_eligible = True
-                recommendation = "COLD STORAGE CANDIDATE"
-                reason = (f"Single standalone snapshot. No lineage sharing. "
-                          f"Archive saves 75% (${newest_full_gb * std_price:.2f} → "
-                          f"${newest_full_gb * archive_price:.2f}/month).")
-            else:
-                recommendation = "KEEP IN STANDARD"
-                reason = "Single snapshot but archive not cheaper (unexpected - check pricing)."
-
-        # Case 5: Volume exists with high change rate (>20%)
-        elif volume_exists and monthly_change_rate is not None and monthly_change_rate > 20:
-            cold_eligible = True
-            recommendation = "COLD STORAGE CANDIDATE (HIGH CHURN)"
-            reason = (f"Volume has {monthly_change_rate:.1f}% monthly change rate (>{20}% threshold). "
-                      f"Monthly snapshots accumulate unique blocks quickly, making cold storage "
-                      f"cost-effective for long-retention monthly snapshots. "
-                      f"NOTE: Only archive monthly snapshots, keep daily/weekly in standard.")
-
-        # Case 6: Volume exists with moderate change rate (15-20%)
-        elif volume_exists and monthly_change_rate is not None and 15 <= monthly_change_rate <= 20:
-            recommendation = "BORDERLINE - REVIEW"
-            reason = (f"Volume has {monthly_change_rate:.1f}% monthly change rate (15-20% borderline zone). "
-                      f"Cold storage may break even. Recommend monitoring for 2-3 months before deciding. "
-                      f"Consider only if retention > 12 months.")
-
-        # Case 7: Volume exists with low change rate (<15%)
-        elif volume_exists and monthly_change_rate is not None and monthly_change_rate < 15:
-            recommendation = "NOT RECOMMENDED"
-            reason = (f"Volume has {monthly_change_rate:.1f}% monthly change rate (<15% threshold). "
-                      f"Archiving would convert incremental to full snapshots, likely INCREASING costs. "
-                      f"Block re-attribution means warm tier cost stays the same + cold cost added.")
-
-        # Case 8: Volume exists but no CloudWatch data
-        elif volume_exists and monthly_change_rate is None:
-            recommendation = "INSUFFICIENT DATA"
-            reason = (f"Volume exists but no CloudWatch VolumeWriteBytes data available. "
-                      f"Enable detailed monitoring or check if volume is attached. "
-                      f"Cannot determine change rate for cold storage assessment.")
-
-        # Case 9: Mixed expired + active
+        # Case 3: Mixed expired + active
         elif expired_count > 0:
             recommendation = "HOUSEKEEP FIRST"
-            reason = (f"{expired_count}/{len(snaps)} snapshots have expired retention. "
-                      f"Delete expired snapshots first, then re-evaluate remaining for cold storage.")
+            reason = (f"{expired_count}/{len(snaps)} snapshots expired. "
+                      f"Delete expired first, then re-evaluate.")
 
-        # Default
+        # Case 4: Volume decommissioned
+        elif not volume_exists:
+            recommendation = "COLD STORAGE CANDIDATE"
+            reason = (f"Volume decommissioned. No new snapshots will be created. "
+                      f"All {len(snaps)} snapshots can be archived — no re-attribution issue. "
+                      f"Saves ~75% (${newest_full_gb * std_price:.2f} → "
+                      f"${newest_full_gb * archive_price:.2f}/month).")
+
+        # Case 5: Single snapshot
+        elif len(snaps) == 1:
+            recommendation = "COLD STORAGE CANDIDATE"
+            reason = (f"Single standalone snapshot — no lineage sharing. "
+                      f"Archive saves 75% (${newest_full_gb * std_price:.2f} → "
+                      f"${newest_full_gb * archive_price:.2f}/month).")
+
+        # Case 6: Multiple snapshots — use EBS Direct API
         else:
-            recommendation = "KEEP IN STANDARD"
-            reason = "No clear benefit from cold storage transition for this volume's snapshot lineage."
+            try:
+                # Evaluate the newest snapshot (most likely archive candidate)
+                # For a complete evaluation, check each snapshot individually
+                snap_idx = len(snaps) - 1  # newest
+                snap_id = snaps[snap_idx]["SnapshotId"]
+                prev_snap_id = snaps[snap_idx - 1]["SnapshotId"] if snap_idx > 0 else None
+                next_snap_id = snaps[snap_idx + 1]["SnapshotId"] if snap_idx < len(snaps) - 1 else None
+
+                # Get full block count for this snapshot
+                full_blocks = count_snapshot_blocks(ebs, snap_id)
+
+                # Get unreferenced block count
+                unreferenced = get_unreferenced_blocks(ebs, snap_id, prev_snap_id, next_snap_id)
+
+                if unreferenced is None:
+                    # Only snapshot (shouldn't reach here, but safety)
+                    unreferenced_pct = 100.0
+                elif full_blocks > 0:
+                    unreferenced_pct = (unreferenced / full_blocks) * 100
+                else:
+                    unreferenced_pct = 0.0
+
+                if unreferenced_pct >= THRESHOLD_PCT:
+                    recommendation = "COLD STORAGE CANDIDATE"
+                    reason = (f"Unreferenced blocks = {unreferenced_pct:.1f}% of full snapshot "
+                              f"(>= {THRESHOLD_PCT}% threshold). "
+                              f"Archiving saves money. "
+                              f"Unreferenced: {unreferenced} blocks, Full: {full_blocks} blocks.")
+                else:
+                    recommendation = "NOT RECOMMENDED"
+                    reason = (f"Unreferenced blocks = {unreferenced_pct:.1f}% of full snapshot "
+                              f"(< {THRESHOLD_PCT}% threshold). "
+                              f"Archiving would likely INCREASE costs due to re-attribution. "
+                              f"Unreferenced: {unreferenced} blocks, Full: {full_blocks} blocks.")
+
+            except Exception as e:
+                recommendation = "ERROR - MANUAL REVIEW"
+                reason = f"Could not query EBS Direct API: {e}"
 
         volume_results.append({
             "region": region,
@@ -318,27 +369,22 @@ def evaluate_volumes(region, profile=None):
             "volume_exists": "Yes" if volume_exists else "No (Decommissioned)",
             "total_snapshots": len(snaps),
             "oldest_snapshot_id": oldest_snap["SnapshotId"],
-            "oldest_snapshot_date": oldest_date.isoformat(),
+            "oldest_snapshot_date": oldest_snap["StartTime"].isoformat(),
             "newest_snapshot_id": newest_snap["SnapshotId"],
-            "newest_snapshot_date": newest_date.isoformat(),
+            "newest_snapshot_date": newest_snap["StartTime"].isoformat(),
             "snapshot_span_days": span_days,
-            "monthly_change_rate_pct": f"{monthly_change_rate:.1f}%" if monthly_change_rate is not None else "N/A",
-            "write_bytes_30d_gb": round(write_bytes_30d / (1024**3), 2) if write_bytes_30d else "N/A",
             "newest_full_snapshot_gb": round(newest_full_gb, 2),
+            "unreferenced_pct": f"{unreferenced_pct:.1f}%" if unreferenced_pct is not None else "N/A",
             "expired_snapshots": expired_count,
-            "active_expiry_snapshots": active_expiry_count,
             "min_days_to_expiry": min_expiry_days if min_expiry_days is not None else "No expiry",
-            "max_retention_days": max_retention if max_retention else "N/A",
             "warm_cost_per_month_est": round(newest_full_gb * std_price, 2),
             "cold_cost_per_month_est": round(newest_full_gb * archive_price, 2),
             "recommendation": recommendation,
             "decision_reason": reason,
         })
-
         print(f"    → {recommendation}")
 
     # Output
-    print(f"\nWriting results...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_filename = f"ebs_cold_storage_eval_{region}_{timestamp}.csv"
 
@@ -347,83 +393,54 @@ def evaluate_volumes(region, profile=None):
             writer = csv.DictWriter(f, fieldnames=volume_results[0].keys())
             writer.writeheader()
             writer.writerows(volume_results)
-        print(f"  CSV: {csv_filename}")
+        print(f"\n  CSV: {csv_filename}")
 
-        if HAS_OPENPYXL:
-            xlsx_filename = f"ebs_cold_storage_eval_{region}_{timestamp}.xlsx"
-            wb = Workbook()
+    if HAS_OPENPYXL and volume_results:
+        xlsx_filename = f"ebs_cold_storage_eval_{region}_{timestamp}.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Cold Storage Assessment"
+        headers = list(volume_results[0].keys())
+        ws.append(headers)
 
-            # Sheet 1: Volume-Level Cold Storage Assessment
-            ws = wb.active
-            ws.title = "Cold Storage Assessment"
-            headers = list(volume_results[0].keys())
-            ws.append(headers)
+        green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+        orange_fill = PatternFill(start_color="FFB347", end_color="FFB347", fill_type="solid")
+        red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
 
-            green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
-            orange_fill = PatternFill(start_color="FFB347", end_color="FFB347", fill_type="solid")
-            red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
-            yellow_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+        for row_data in volume_results:
+            ws.append([row_data[h] for h in headers])
+            rec = row_data["recommendation"]
+            if "COLD STORAGE CANDIDATE" in rec:
+                fill = green_fill
+            elif "HOUSEKEEP" in rec:
+                fill = orange_fill
+            elif rec in ("NOT RECOMMENDED", "NOT ELIGIBLE"):
+                fill = red_fill
+            else:
+                continue
+            for cell in ws[ws.max_row]:
+                cell.fill = fill
 
-            for row_data in volume_results:
-                ws.append([row_data[h] for h in headers])
-                rec = row_data["recommendation"]
-                if "COLD STORAGE CANDIDATE" in rec:
-                    for cell in ws[ws.max_row]:
-                        cell.fill = green_fill
-                elif "HOUSEKEEP" in rec:
-                    for cell in ws[ws.max_row]:
-                        cell.fill = orange_fill
-                elif "NOT RECOMMENDED" in rec or "NOT ELIGIBLE" in rec:
-                    for cell in ws[ws.max_row]:
-                        cell.fill = red_fill
-                elif "BORDERLINE" in rec:
-                    for cell in ws[ws.max_row]:
-                        cell.fill = yellow_fill
-
-            # Sheet 2: Snapshot Detail (for reference)
-            ws2 = wb.create_sheet("Snapshot Detail")
-            snap_headers = ["region", "volume_id", "snapshot_id", "created", "volume_size_gb",
-                            "full_snapshot_size_gb", "expiry_status", "expiry_source"]
-            ws2.append(snap_headers)
-            for vol_id, snaps in vol_snaps.items():
-                for s in snaps:
-                    sid = s["SnapshotId"]
-                    full_gb = round(int(s.get("FullSnapshotSizeInBytes", 0)) / (1024**3), 2)
-                    exp_info = snap_expiration.get(sid, {})
-                    days_left = exp_info.get("days_left")
-                    if days_left is not None:
-                        expiry_status = f"Expired ({abs(days_left)}d ago)" if days_left < 0 else f"{days_left}d remaining"
-                    else:
-                        expiry_status = "No expiry set"
-                    ws2.append([region, vol_id, sid, s["StartTime"].isoformat(),
-                                s["VolumeSize"], full_gb, expiry_status,
-                                exp_info.get("source", "N/A")])
-
-            wb.save(xlsx_filename)
-            print(f"  Excel: {xlsx_filename}")
-            print(f"    Sheet 1: Cold Storage Assessment (volume-level)")
-            print(f"    Sheet 2: Snapshot Detail (individual snapshots)")
+        wb.save(xlsx_filename)
+        print(f"  Excel: {xlsx_filename}")
 
     # Summary
     print(f"\n{'='*70}")
-    print(f"SUMMARY - {region}")
+    print(f"SUMMARY — {region}")
     print(f"{'='*70}")
     print(f"  Volumes evaluated: {len(volume_results)}")
-    cold_candidates = [r for r in volume_results if "COLD STORAGE CANDIDATE" in r["recommendation"]]
+    candidates = [r for r in volume_results if "COLD STORAGE CANDIDATE" in r["recommendation"]]
     housekeep = [r for r in volume_results if "HOUSEKEEP" in r["recommendation"]]
-    not_recommended = [r for r in volume_results if "NOT RECOMMENDED" in r["recommendation"]]
-    borderline = [r for r in volume_results if "BORDERLINE" in r["recommendation"]]
-    print(f"  Cold storage candidates:    {len(cold_candidates)} (green)")
-    print(f"  Housekeep/delete:           {len(housekeep)} (orange)")
-    print(f"  Not recommended for cold:   {len(not_recommended)} (red)")
-    print(f"  Borderline - review:        {len(borderline)} (yellow)")
-    if cold_candidates:
+    not_rec = [r for r in volume_results if r["recommendation"] in ("NOT RECOMMENDED", "NOT ELIGIBLE")]
+    print(f"  ✅ Cold storage candidates: {len(candidates)}")
+    print(f"  🟠 Housekeep/delete first:  {len(housekeep)}")
+    print(f"  ❌ Not recommended/eligible: {len(not_rec)}")
+    if candidates:
         print(f"\n  COLD STORAGE CANDIDATES:")
-        for c in cold_candidates:
+        for c in candidates:
             print(f"    {c['volume_id']} | {c['total_snapshots']} snaps | "
-                  f"{c['monthly_change_rate_pct']} change | {c['recommendation']}")
+                  f"unreferenced: {c['unreferenced_pct']} | {c['recommendation']}")
     print(f"{'='*70}\n")
-
     return volume_results
 
 
