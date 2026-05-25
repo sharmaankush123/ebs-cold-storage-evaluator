@@ -212,7 +212,7 @@ def get_unreferenced_blocks(ebs_client, snap_id, prev_snap_id, next_snap_id):
         return len(changed_from_prev & changed_to_next)
 
 
-def evaluate_volumes(region, profile=None):
+def evaluate_volumes(region, profile=None, max_retention_days=None):
     """Main evaluation at VOLUME level using EBS Direct API."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
@@ -279,6 +279,15 @@ def evaluate_volumes(region, profile=None):
                     if min_expiry_days is None or days_left < min_expiry_days:
                         min_expiry_days = days_left
 
+        # Check max retention period (user-specified)
+        exceeds_retention_count = 0
+        if max_retention_days is not None:
+            now = datetime.now(oldest_snap["StartTime"].tzinfo)
+            for s in snaps:
+                age_days = (now - s["StartTime"]).days
+                if age_days > max_retention_days:
+                    exceeds_retention_count += 1
+
         # Get full snapshot size (newest)
         newest_full_bytes = int(newest_snap.get("FullSnapshotSizeInBytes", 0))
         newest_full_gb = newest_full_bytes / (1024**3) if newest_full_bytes else vol_size_gb
@@ -287,6 +296,17 @@ def evaluate_volumes(region, profile=None):
         recommendation = ""
         reason = ""
         unreferenced_pct = None
+
+        # Case 0: Snapshots exceed max retention period (user-specified)
+        if max_retention_days is not None and exceeds_retention_count == len(snaps):
+            recommendation = "HOUSEKEEP - EXCEEDS RETENTION"
+            reason = (f"All {len(snaps)} snapshots exceed max retention of {max_retention_days} days. "
+                      f"Consider deleting to save ~${newest_full_gb * std_price:.2f}/month.")
+
+        elif max_retention_days is not None and exceeds_retention_count > 0:
+            recommendation = "HOUSEKEEP - EXCEEDS RETENTION"
+            reason = (f"{exceeds_retention_count}/{len(snaps)} snapshots exceed max retention of "
+                      f"{max_retention_days} days. Consider deleting over-retained snapshots.")
 
         # Case 1: All snapshots expired
         if expired_count == len(snaps):
@@ -376,6 +396,7 @@ def evaluate_volumes(region, profile=None):
             "newest_full_snapshot_gb": round(newest_full_gb, 2),
             "unreferenced_pct": f"{unreferenced_pct:.1f}%" if unreferenced_pct is not None else "N/A",
             "expired_snapshots": expired_count,
+            "exceeds_retention": exceeds_retention_count if max_retention_days else "N/A",
             "min_days_to_expiry": min_expiry_days if min_expiry_days is not None else "No expiry",
             "warm_cost_per_month_est": round(newest_full_gb * std_price, 2),
             "cold_cost_per_month_est": round(newest_full_gb * archive_price, 2),
@@ -406,12 +427,15 @@ def evaluate_volumes(region, profile=None):
         green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
         orange_fill = PatternFill(start_color="FFB347", end_color="FFB347", fill_type="solid")
         red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+        yellow_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
 
         for row_data in volume_results:
             ws.append([row_data[h] for h in headers])
             rec = row_data["recommendation"]
             if "COLD STORAGE CANDIDATE" in rec:
                 fill = green_fill
+            elif "EXCEEDS RETENTION" in rec:
+                fill = yellow_fill
             elif "HOUSEKEEP" in rec:
                 fill = orange_fill
             elif rec in ("NOT RECOMMENDED", "NOT ELIGIBLE"):
@@ -420,6 +444,45 @@ def evaluate_volumes(region, profile=None):
                 continue
             for cell in ws[ws.max_row]:
                 cell.fill = fill
+
+        # --- Cost Savings Summary Sheet ---
+        ss = wb.create_sheet("Cost Savings Summary")
+        ss.append(["Category", "Volumes", "Snapshots", "Monthly Warm Cost", "Monthly Cold Cost", "Monthly Savings"])
+
+        candidates = [r for r in volume_results if "COLD STORAGE CANDIDATE" in r["recommendation"]]
+        housekeep = [r for r in volume_results if "HOUSEKEEP" in r["recommendation"]]
+        retention_exceeded = [r for r in volume_results if "EXCEEDS RETENTION" in r["recommendation"]]
+
+        cand_warm = sum(r["warm_cost_per_month_est"] for r in candidates)
+        cand_cold = sum(r["cold_cost_per_month_est"] for r in candidates)
+        cand_snaps = sum(r["total_snapshots"] for r in candidates)
+
+        hk_warm = sum(r["warm_cost_per_month_est"] for r in housekeep)
+        hk_snaps = sum(r["total_snapshots"] for r in housekeep)
+
+        ret_warm = sum(r["warm_cost_per_month_est"] for r in retention_exceeded)
+        ret_snaps = sum(r["exceeds_retention"] for r in retention_exceeded if r["exceeds_retention"] != "N/A")
+
+        ss.append(["Archive to Cold Storage", len(candidates), cand_snaps,
+                   f"${cand_warm:.2f}", f"${cand_cold:.2f}", f"${cand_warm - cand_cold:.2f}"])
+        ss.append(["Housekeep (Delete Expired)", len(housekeep), hk_snaps,
+                   f"${hk_warm:.2f}", "$0.00", f"${hk_warm:.2f}"])
+        if max_retention_days:
+            ss.append(["Exceeds Retention (Delete)", len(retention_exceeded), int(ret_snaps),
+                       f"${ret_warm:.2f}", "$0.00", f"${ret_warm:.2f}"])
+
+        total_savings = (cand_warm - cand_cold) + hk_warm + ret_warm
+        ss.append([])
+        ss.append(["TOTAL POTENTIAL SAVINGS", "", "", "", "", f"${total_savings:.2f}/month"])
+        ss.append(["ANNUAL SAVINGS", "", "", "", "", f"${total_savings * 12:.2f}/year"])
+
+        # Bold the totals
+        from openpyxl.styles import Font
+        bold = Font(bold=True)
+        for cell in ss[ss.max_row]:
+            cell.font = bold
+        for cell in ss[ss.max_row - 1]:
+            cell.font = bold
 
         wb.save(xlsx_filename)
         print(f"  Excel: {xlsx_filename}")
@@ -447,4 +510,5 @@ def evaluate_volumes(region, profile=None):
 if __name__ == "__main__":
     profile = sys.argv[1] if len(sys.argv) > 1 else None
     region = sys.argv[2] if len(sys.argv) > 2 else "us-east-1"
-    evaluate_volumes(region=region, profile=profile)
+    max_retention_days = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    evaluate_volumes(region=region, profile=profile, max_retention_days=max_retention_days)

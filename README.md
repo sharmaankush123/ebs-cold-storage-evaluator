@@ -67,10 +67,11 @@ This gives the **exact** ratio needed for the 25% comparison.
 
 ## Decision Logic
 
-The evaluator assigns one of 6 recommendations per volume:
+The evaluator assigns one of 7 recommendations per volume:
 
 | # | Recommendation | Colour | Criteria |
 |---|---|---|---|
+| 0 | **HOUSEKEEP - EXCEEDS RETENTION** | 🟡 Yellow | Snapshots exceed user-specified max retention period |
 | 1 | **HOUSEKEEP - DELETE ALL** | 🟠 Orange | All snapshots have expired retention — delete to save costs |
 | 2 | **NOT ELIGIBLE** | 🔴 Red | Snapshots expire within 90 days (archive minimum retention) |
 | 3 | **HOUSEKEEP FIRST** | 🟠 Orange | Mix of expired and active snapshots — clean up expired first |
@@ -85,6 +86,12 @@ The evaluator assigns one of 6 recommendations per volume:
 │ For each EBS Volume with snapshots  │
 └──────────────┬──────────────────────┘
                │
+               ▼
+┌──────────────────────────────────┐     YES    ┌─────────────────────────────────┐
+│ Max retention specified AND      │────────────▶│ HOUSEKEEP - EXCEEDS RETENTION   │
+│ snapshots exceed max retention?  │             │ (flag for deletion)             │
+└──────────────┬───────────────────┘             └─────────────────────────────────┘
+               │ NO / not specified
                ▼
 ┌──────────────────────────────────┐     YES    ┌─────────────────────────┐
 │ All snapshots expired?           │────────────▶│ HOUSEKEEP - DELETE ALL  │
@@ -160,25 +167,31 @@ The evaluator assigns one of 6 recommendations per volume:
 ```bash
 git clone https://github.com/sharmaankush123/ebs-cold-storage-evaluator.git
 cd ebs-cold-storage-evaluator
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ### Execution
 
 ```bash
 # Basic usage
-python ebs_cold_storage_evaluator.py <aws-profile> <region>
+python3 ebs_cold_storage_evaluator.py <aws-profile> <region>
+
+# With max retention period (flags snapshots older than N days as housekeep candidates)
+python3 ebs_cold_storage_evaluator.py <aws-profile> <region> <max-retention-days>
 
 # Examples
-python ebs_cold_storage_evaluator.py default us-east-1
-python ebs_cold_storage_evaluator.py production eu-west-1
+python3 ebs_cold_storage_evaluator.py default us-east-1
+python3 ebs_cold_storage_evaluator.py production eu-west-1
+python3 ebs_cold_storage_evaluator.py default us-east-1 365   # flag snapshots older than 1 year
 ```
 
 ### Output
 
 The script generates:
 1. **CSV file** — machine-readable results
-2. **Excel file (.xlsx)** — colour-coded recommendations
+2. **Excel file (.xlsx)** — colour-coded recommendations with two sheets:
+   - **Cold Storage Assessment** — per-volume recommendations (colour-coded)
+   - **Cost Savings Summary** — total potential savings if recommendations are applied
 
 ### Output Columns
 
@@ -197,11 +210,25 @@ The script generates:
 | `newest_full_snapshot_gb` | Full snapshot size (what archive tier would store) |
 | `unreferenced_pct` | % of blocks unique to this snapshot (the key metric) |
 | `expired_snapshots` | Count of snapshots past their retention date |
+| `exceeds_retention` | Count of snapshots exceeding max retention period (if specified) |
 | `min_days_to_expiry` | Shortest time until a snapshot expires |
 | `warm_cost_per_month_est` | Estimated monthly cost in Standard tier |
 | `cold_cost_per_month_est` | Estimated monthly cost in Archive tier |
 | `recommendation` | Volume-level recommendation |
 | `decision_reason` | Detailed explanation |
+
+### Cost Savings Summary Sheet
+
+The second Excel sheet provides an at-a-glance savings breakdown:
+
+| Category | Description |
+|----------|-------------|
+| Archive to Cold Storage | Savings from transitioning candidates to archive tier |
+| Housekeep (Delete Expired) | Savings from deleting expired snapshots |
+| Exceeds Retention (Delete) | Savings from deleting over-retained snapshots |
+| **Total Potential Savings** | Combined monthly and annual savings |
+
+![Cost Savings Summary Example](images/cost_savings_summary.png)
 
 ## Cost Comparison Example
 
