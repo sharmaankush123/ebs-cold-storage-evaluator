@@ -228,6 +228,8 @@ The second Excel sheet provides an at-a-glance savings breakdown:
 | Exceeds Retention (Delete) | Savings from deleting over-retained snapshots |
 | **Total Potential Savings** | Combined monthly and annual savings |
 
+![Cost Savings Summary Example](images/cost_savings_summary.png)
+
 ## Cost Comparison Example
 
 **1 TB volume, 2 snapshots in lineage:**
