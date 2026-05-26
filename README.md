@@ -173,16 +173,19 @@ pip3 install -r requirements.txt
 ### Execution
 
 ```bash
-# Basic usage
+# Single region
 python3 ebs_cold_storage_evaluator.py <aws-profile> <region>
 
+# Multiple regions (comma-separated)
+python3 ebs_cold_storage_evaluator.py <aws-profile> <region1,region2,region3>
+
 # With max retention period (flags snapshots older than N days as housekeep candidates)
-python3 ebs_cold_storage_evaluator.py <aws-profile> <region> <max-retention-days>
+python3 ebs_cold_storage_evaluator.py <aws-profile> <region(s)> <max-retention-days>
 
 # Examples
 python3 ebs_cold_storage_evaluator.py default us-east-1
-python3 ebs_cold_storage_evaluator.py production eu-west-1
-python3 ebs_cold_storage_evaluator.py default us-east-1 365   # flag snapshots older than 1 year
+python3 ebs_cold_storage_evaluator.py production us-east-1,eu-west-1,ap-southeast-1
+python3 ebs_cold_storage_evaluator.py default us-east-1,us-west-2,eu-west-1,ap-south-1,ap-northeast-1 365
 ```
 
 ### Output
