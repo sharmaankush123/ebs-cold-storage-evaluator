@@ -421,7 +421,7 @@ def evaluate_volumes(region, profile=None, max_retention_days=None):
     csv_filename = f"ebs_cold_storage_eval_{region}_{timestamp}.csv"
 
     if volume_results:
-        with open(csv_filename, "w", newline="") as f:
+        with open(csv_filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=volume_results[0].keys())
             writer.writeheader()
             writer.writerows(volume_results)
@@ -535,7 +535,7 @@ if __name__ == "__main__":
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         region_label = "_".join(r.strip() for r in regions) if len(regions) <= 3 else f"{len(regions)}_regions"
         csv_filename = f"ebs_cold_storage_eval_{region_label}_{timestamp}.csv"
-        with open(csv_filename, "w", newline="") as f:
+        with open(csv_filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
             writer.writeheader()
             writer.writerows(all_results)
