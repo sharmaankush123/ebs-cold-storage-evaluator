@@ -509,6 +509,93 @@ def evaluate_volumes(region, profile=None, max_retention_days=None):
 
 if __name__ == "__main__":
     profile = sys.argv[1] if len(sys.argv) > 1 else None
-    region = sys.argv[2] if len(sys.argv) > 2 else "us-east-1"
+    regions = sys.argv[2].split(",") if len(sys.argv) > 2 else ["us-east-1"]
     max_retention_days = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    evaluate_volumes(region=region, profile=profile, max_retention_days=max_retention_days)
+
+    all_results = []
+    for region in regions:
+        region = region.strip()
+        results = evaluate_volumes(region=region, profile=profile, max_retention_days=max_retention_days)
+        if results:
+            all_results.extend(results)
+
+    # Combined output across all regions
+    if all_results:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        region_label = "_".join(r.strip() for r in regions) if len(regions) <= 3 else f"{len(regions)}_regions"
+        csv_filename = f"ebs_cold_storage_eval_{region_label}_{timestamp}.csv"
+        with open(csv_filename, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
+            writer.writeheader()
+            writer.writerows(all_results)
+        print(f"\n  Combined CSV: {csv_filename}")
+
+        if HAS_OPENPYXL:
+            xlsx_filename = f"ebs_cold_storage_eval_{region_label}_{timestamp}.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Cold Storage Assessment"
+            headers = list(all_results[0].keys())
+            ws.append(headers)
+
+            green_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+            orange_fill = PatternFill(start_color="FFB347", end_color="FFB347", fill_type="solid")
+            red_fill = PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
+            yellow_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+
+            for row_data in all_results:
+                ws.append([row_data[h] for h in headers])
+                rec = row_data["recommendation"]
+                if "COLD STORAGE CANDIDATE" in rec:
+                    fill = green_fill
+                elif "EXCEEDS RETENTION" in rec:
+                    fill = yellow_fill
+                elif "HOUSEKEEP" in rec:
+                    fill = orange_fill
+                elif rec in ("NOT RECOMMENDED", "NOT ELIGIBLE"):
+                    fill = red_fill
+                else:
+                    continue
+                for cell in ws[ws.max_row]:
+                    cell.fill = fill
+
+            # --- Cost Savings Summary Sheet ---
+            ss = wb.create_sheet("Cost Savings Summary")
+            ss.append(["Category", "Volumes", "Snapshots", "Monthly Warm Cost", "Monthly Cold Cost", "Monthly Savings"])
+
+            candidates = [r for r in all_results if "COLD STORAGE CANDIDATE" in r["recommendation"]]
+            housekeep = [r for r in all_results if "HOUSEKEEP" in r["recommendation"]]
+            retention_exceeded = [r for r in all_results if "EXCEEDS RETENTION" in r["recommendation"]]
+
+            cand_warm = sum(r["warm_cost_per_month_est"] for r in candidates)
+            cand_cold = sum(r["cold_cost_per_month_est"] for r in candidates)
+            cand_snaps = sum(r["total_snapshots"] for r in candidates)
+
+            hk_warm = sum(r["warm_cost_per_month_est"] for r in housekeep)
+            hk_snaps = sum(r["total_snapshots"] for r in housekeep)
+
+            ret_warm = sum(r["warm_cost_per_month_est"] for r in retention_exceeded)
+            ret_snaps = sum(r["exceeds_retention"] for r in retention_exceeded if r["exceeds_retention"] != "N/A")
+
+            ss.append(["Archive to Cold Storage", len(candidates), cand_snaps,
+                       f"${cand_warm:.2f}", f"${cand_cold:.2f}", f"${cand_warm - cand_cold:.2f}"])
+            ss.append(["Housekeep (Delete Expired)", len(housekeep), hk_snaps,
+                       f"${hk_warm:.2f}", "$0.00", f"${hk_warm:.2f}"])
+            if max_retention_days:
+                ss.append(["Exceeds Retention (Delete)", len(retention_exceeded), int(ret_snaps),
+                           f"${ret_warm:.2f}", "$0.00", f"${ret_warm:.2f}"])
+
+            total_savings = (cand_warm - cand_cold) + hk_warm + ret_warm
+            ss.append([])
+            ss.append(["TOTAL POTENTIAL SAVINGS", "", "", "", "", f"${total_savings:.2f}/month"])
+            ss.append(["ANNUAL SAVINGS", "", "", "", "", f"${total_savings * 12:.2f}/year"])
+
+            from openpyxl.styles import Font
+            bold = Font(bold=True)
+            for cell in ss[ss.max_row]:
+                cell.font = bold
+            for cell in ss[ss.max_row - 1]:
+                cell.font = bold
+
+            wb.save(xlsx_filename)
+            print(f"  Combined Excel: {xlsx_filename}")
