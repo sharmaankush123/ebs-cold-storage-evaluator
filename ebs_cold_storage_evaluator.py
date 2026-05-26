@@ -354,33 +354,44 @@ def evaluate_volumes(region, profile=None, max_retention_days=None):
                 # Get full block count for this snapshot
                 full_blocks = count_snapshot_blocks(ebs, snap_id)
 
-                # Get unreferenced block count
-                unreferenced = get_unreferenced_blocks(ebs, snap_id, prev_snap_id, next_snap_id)
-
-                if unreferenced is None:
-                    # Only snapshot (shouldn't reach here, but safety)
-                    unreferenced_pct = 100.0
-                elif full_blocks > 0:
-                    unreferenced_pct = (unreferenced / full_blocks) * 100
-                else:
-                    unreferenced_pct = 0.0
-
-                if unreferenced_pct >= THRESHOLD_PCT:
-                    recommendation = "COLD STORAGE CANDIDATE"
-                    reason = (f"Unreferenced blocks = {unreferenced_pct:.1f}% of full snapshot "
-                              f"(>= {THRESHOLD_PCT}% threshold). "
-                              f"Archiving saves money. "
-                              f"Unreferenced: {unreferenced} blocks, Full: {full_blocks} blocks.")
-                else:
+                if full_blocks == 0:
+                    # Empty snapshot — no data to archive
                     recommendation = "NOT RECOMMENDED"
-                    reason = (f"Unreferenced blocks = {unreferenced_pct:.1f}% of full snapshot "
-                              f"(< {THRESHOLD_PCT}% threshold). "
-                              f"Archiving would likely INCREASE costs due to re-attribution. "
-                              f"Unreferenced: {unreferenced} blocks, Full: {full_blocks} blocks.")
+                    reason = (f"Newest snapshot {snap_id} is empty (0 blocks). "
+                              f"No data to archive.")
+                else:
+                    # Get unreferenced block count
+                    unreferenced = get_unreferenced_blocks(ebs, snap_id, prev_snap_id, next_snap_id)
+
+                    if unreferenced is None:
+                        unreferenced_pct = 100.0
+                    elif full_blocks > 0:
+                        unreferenced_pct = (unreferenced / full_blocks) * 100
+                    else:
+                        unreferenced_pct = 0.0
+
+                    if unreferenced_pct >= THRESHOLD_PCT:
+                        recommendation = "COLD STORAGE CANDIDATE"
+                        reason = (f"Unreferenced blocks = {unreferenced_pct:.1f}% of full snapshot "
+                                  f"(>= {THRESHOLD_PCT}% threshold). "
+                                  f"Archiving saves money. "
+                                  f"Unreferenced: {unreferenced} blocks, Full: {full_blocks} blocks.")
+                    else:
+                        recommendation = "NOT RECOMMENDED"
+                        reason = (f"Unreferenced blocks = {unreferenced_pct:.1f}% of full snapshot "
+                                  f"(< {THRESHOLD_PCT}% threshold). "
+                                  f"Archiving would likely INCREASE costs due to re-attribution. "
+                                  f"Unreferenced: {unreferenced} blocks, Full: {full_blocks} blocks.")
 
             except Exception as e:
-                recommendation = "ERROR - MANUAL REVIEW"
-                reason = f"Could not query EBS Direct API: {e}"
+                error_msg = str(e)
+                if "is empty" in error_msg or "ValidationException" in error_msg:
+                    recommendation = "NOT RECOMMENDED"
+                    reason = (f"Snapshot in lineage is empty (no blocks written). "
+                              f"No data to archive. Detail: {error_msg}")
+                else:
+                    recommendation = "ERROR - MANUAL REVIEW"
+                    reason = f"Could not query EBS Direct API: {e}"
 
         volume_results.append({
             "region": region,
